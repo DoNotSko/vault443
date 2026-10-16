@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # any front end is rendered by claude AI. all backend work is mine
 
-import time, os, sys, socket, random, uuid
+import time, os, sys, socket, random, uuid, glob, csv
 
-from threading  import Thread
-from PIL        import Image
-from blessed    import Terminal
+from threading    import Thread
+from datetime     import datetime
+from urllib.parse import urlparse
+from PIL          import Image
+from blessed      import Terminal
 
 # ── escape helpers ────────────────────────────────────────────────────────────
 RESET = "\033[0m"
@@ -28,6 +30,30 @@ except Exception:
     tls_inspection = None
 
 
+# ── batch helpers ─────────────────────────────────────────────────────────────
+
+def load_tls_targets(path):
+    """Read a host list. Accepts https://site.com/path, site.com, site.com:8443,
+    blank lines and # comments. Returns a de-duplicated list of hostnames."""
+    targets = []
+    with open(path, encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if "://" not in line:
+                line = "https://" + line
+            try:
+                host = urlparse(line).hostname
+            except ValueError:
+                host = None
+            if host:
+                targets.append(host.lower())
+    return list(dict.fromkeys(targets))
+
+
+def expand_path(raw):
+    return os.path.abspath(os.path.expanduser(raw.strip().strip('"').strip("'")))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -68,6 +94,8 @@ class Dashboard:
         "keyword": "e.g. price, product-title",
     }
 
+    TLS_BATCH_TIMEOUT = 20   # seconds to wait per host if start() is non-blocking
+
     # ── init ──────────────────────────────────────────────────────────────────
     def __init__(self, theme="pipboy", animate=10):
 
@@ -91,14 +119,21 @@ class Dashboard:
         self.web_scraper_mode    = False
         self.tls_inspect_mode    = False
 
-        # lifecycle  0=closed 1=input 2=running 3=done
+        # lifecycle  0=closed 1=input 2=running 3=done 4=batch
         self.web_scraper_state   = 0
         self.tls_inspect_state   = 0
 
-        # input routing  None | "tls_host" | "scraper_domain" | "scraper_filter_type" | "scraper_flag"
+        # input routing  None | "tls_host" | "tls_file" | "scraper_domain" | "scraper_filter_type" | "scraper_flag"
         self.active_input_mode   = None
         self.input_buffer        = ""
         self._scraper_domain     = ""
+
+        # TLS batch state
+        self.tls_batch_mode      = False
+        self.tls_batch           = self._new_batch_state()
+        self._last_batch_path    = ""
+        self._path_matches       = []     # tab-completion candidates shown under prompt
+        self._path_error         = ""
 
         # scraper filter selection state
         self._scraper_filter_key      = None
@@ -280,14 +315,105 @@ class Dashboard:
 
     # ── TLS inspect panel ─────────────────────────────────────────────────────
 
+    def _tls_file_prompt_lines(self, inner):
+        raw  = self.input_buffer
+        full = expand_path(raw) if raw.strip() else ""
+
+        if not raw.strip():
+            check = "  (type a path — ~ and relative paths work)"
+        elif os.path.isfile(full):
+            check = "  ✓ file found"
+        elif os.path.isdir(full):
+            check = "  … directory — keep typing or press TAB"
+        else:
+            check = "  ✗ no such file"
+
+        lines = [
+            "  Path to host list file:",
+            f"  > {raw[-(inner - 6):]}█",
+            check,
+        ]
+        if self._path_error:
+            lines.append(f"  ! {self._path_error}"[:inner])
+        if self._path_matches:
+            lines.append("")
+            shown = self._path_matches[:6]
+            for m in shown:
+                lines.append(f"    {m}"[:inner])
+            if len(self._path_matches) > len(shown):
+                lines.append(f"    … +{len(self._path_matches) - len(shown)} more")
+        lines += [
+            "",
+            f"  cwd: {os.getcwd()}"[:inner],
+            "  TAB complete  |  ENTER start  |  ESC cancel",
+        ]
+        return lines
+
+    def _tls_batch_lines(self, inner, height, used):
+        b     = self.tls_batch
+        res   = list(b["results"])          # snapshot; worker appends concurrently
+        done  = len(res)
+        total = max(1, b["total"])
+
+        bar_w = max(10, inner - 16)
+        fill  = int(bar_w * done / total)
+        lines = [
+            f"  File    : {os.path.basename(b['path'])}"[:inner],
+            f"  [{'█' * fill}{'░' * (bar_w - fill)}] {done}/{b['total']}",
+        ]
+        if b["running"]:
+            dots   = "." * (int(time.time() * 2) % 4)
+            lines += [f"  Scanning: {b['current']}{dots}"[:inner]]
+        else:
+            ok   = sum(1 for r in res if not r.get("error"))
+            lines += [f"  Done    : {ok} ok, {done - ok} failed"]
+
+        # columns: domain | status | tls | expires/error
+        st_w, tls_w = 10, 9
+        dom_w = max(12, min(36, inner - 2 - st_w - tls_w - 14))
+        lines += [
+            "",
+            f"  {'DOMAIN':<{dom_w}}{'STATUS':<{st_w}}{'TLS':<{tls_w}}EXPIRES / ERROR"[:inner],
+        ]
+
+        footer_rows = 6 if not b["running"] else 4
+        visible     = max(1, height - used - len(lines) - footer_rows)
+        max_scroll  = max(0, done - visible)
+        b["scroll"] = min(b["scroll"], max_scroll)
+        if b["running"]:
+            b["scroll"] = max_scroll        # auto-follow while scanning
+
+        for r in res[b["scroll"]:b["scroll"] + visible]:
+            status = str(r.get("status") or ("ERROR" if r.get("error") else "?"))
+            tail   = str(r.get("error") or r.get("expires") or "")
+            lines.append(
+                f"  {str(r.get('domain', '?'))[:dom_w - 1]:<{dom_w}}"
+                f"{status[:st_w - 1]:<{st_w}}"
+                f"{str(r.get('tls', '-'))[:tls_w - 1]:<{tls_w}}"
+                f"{tail}"[:inner]
+            )
+
+        if not b["running"]:
+            lines.append("")
+            if b["out"]:
+                lines.append(f"  Saved → {b['out']}"[-inner:])
+            if done > visible:
+                lines.append(f"  ↑/↓ scroll  ({b['scroll'] + 1}-{min(done, b['scroll'] + visible)} of {done})")
+        return lines
+
     def render_tls_panel(self, width, height):
         screen = self._blank_screen(width, height)
         p      = self.tls_inspect_panel
         inner  = width - 4
         pad_x  = 2
         fc     = self.get_color(self.theme["feed"])
+        b      = self.tls_batch
 
-        if p and p.scanning:
+        if self.tls_batch_mode and b["running"]:
+            status = f"BATCH  {len(b['results'])}/{b['total']}"
+        elif self.tls_batch_mode and b["total"]:
+            status = "BATCH COMPLETE"
+        elif p and p.scanning:
             status = f"SCANNING  {p.host}..."
         elif p and p.scan_done and p.results:
             status = "COMPLETE"
@@ -311,7 +437,12 @@ class Dashboard:
                 f"  > {self.input_buffer}█",
                 "",
                 "  ENTER to scan  |  ESC to cancel",
+                "  (press [F] instead to scan a file of hosts)",
             ]
+        elif self.active_input_mode == "tls_file":
+            lines += self._tls_file_prompt_lines(inner)
+        elif self.tls_batch_mode and b["total"]:
+            lines += self._tls_batch_lines(inner, height, len(lines))
         elif p and p.scanning:
             dots   = "." * (int(time.time() * 2) % 4)
             lines += [f"  Connecting{dots}"]
@@ -329,13 +460,13 @@ class Dashboard:
                     f"  {'TLS':<10}: {str(r.get('tls',    '?'))[:col_w]}",
                     f"  {'Cipher':<10}: {str(r.get('cipher', '?'))[:col_w]}",
                 ]
-            lines += ["", "  [W] scan again  |  [X] close"]
+            lines += ["", "  [W] scan again  |  [F] scan file  |  [X] close"]
         else:
-            lines += ["  Press [W] to scan a domain"]
+            lines += ["  Press [W] to scan a domain, [F] to scan a file"]
 
         lines += [
             dash,
-            "  [W] New scan   [X] Close   [Q] Quit",
+            "  [W] Single  [F] File  [X] Close/Stop  [Q] Quit",
             sep,
         ]
 
@@ -540,7 +671,9 @@ class Dashboard:
         m, s        = divmod(rem, 60)
         stats_inner = right_w - 4
 
+        b = self.tls_batch
         tls_stat = (
+            f"batch {len(b['results'])}/{b['total']}" if b["running"] else
             "scanning" if (self.tls_inspect_panel and self.tls_inspect_panel.scanning) else
             "done"     if (self.tls_inspect_panel and self.tls_inspect_panel.scan_done) else
             "idle"
@@ -571,7 +704,7 @@ class Dashboard:
             )
 
         # ── legend bar ────────────────────────────────────────────────────────
-        legend    = " [W]TLS  [S]Scrape  [T]Theme  [C]Legend  [Q]Quit"
+        legend    = " [W]TLS  [F]TLS File  [S]Scrape  [T]Theme  [C]Legend  [Q]Quit"
         st_txt    = "PAUSED" if self.paused else "LIVE"
         st_col    = self.get_color("bright_red") if self.paused else self.get_color("bright_green")
         bar_inner = main_w - 2
@@ -590,6 +723,36 @@ class Dashboard:
         out.append(self.term.move(th - 1, tw - 1) + "\033[?25l")
         sys.stdout.write("".join(out))
         sys.stdout.flush()
+
+    # ── path tab-completion ───────────────────────────────────────────────────
+
+    def _complete_path(self):
+        raw      = self.input_buffer
+        expanded = os.path.expanduser(raw) if raw else "./"
+        matches  = sorted(glob.glob(glob.escape(expanded) + "*"))
+        self._path_error = ""
+
+        if not matches:
+            self._path_matches = []
+            return
+
+        if len(matches) == 1:
+            completed = matches[0]
+            if os.path.isdir(completed):
+                completed = completed.rstrip(os.sep) + os.sep
+            self._path_matches = []
+        else:
+            completed = os.path.commonprefix(matches)
+            self._path_matches = [
+                os.path.basename(m.rstrip(os.sep)) + (os.sep if os.path.isdir(m) else "")
+                for m in matches
+            ]
+
+        # keep the ~ the user typed instead of expanding it in the buffer
+        home = os.path.expanduser("~")
+        if raw.startswith("~") and completed.startswith(home):
+            completed = "~" + completed[len(home):]
+        self.input_buffer = completed
 
     # ── input handling ────────────────────────────────────────────────────────
 
@@ -620,16 +783,42 @@ class Dashboard:
                             self._scraper_domain   = ""
                         continue
 
+                    # TAB completes paths in the file prompt
+                    if self.active_input_mode == "tls_file" and (
+                            key.code == self.term.KEY_TAB or str(key) == "\t"):
+                        self._complete_path()
+                        continue
+
                     if key.code == self.term.KEY_ENTER:
                         self._commit_input()
-                    elif key.code == self.term.KEY_BACKSPACE:
-                        self.input_buffer = self.input_buffer[:-1]
+                    elif key.code == self.term.KEY_BACKSPACE or key.code == self.term.KEY_DELETE:
+                        self.input_buffer  = self.input_buffer[:-1]
+                        self._path_matches = []
+                        self._path_error   = ""
                     elif key.code == self.term.KEY_ESCAPE:
+                        if self.active_input_mode == "tls_file":
+                            self.tls_inspect_mode = False
                         self.active_input_mode = None
                         self.input_buffer      = ""
+                        self._path_matches     = []
+                        self._path_error       = ""
                     elif not key.is_sequence:
                         self.input_buffer += str(key)
+                        self._path_matches = []
+                        self._path_error   = ""
                     continue
+
+                # ── batch results scrolling ───────────────────────────────────
+                if self.tls_inspect_mode and self.tls_batch_mode:
+                    b = self.tls_batch
+                    if key.code == self.term.KEY_UP:
+                        b["scroll"] = max(0, b["scroll"] - 1); continue
+                    if key.code == self.term.KEY_DOWN:
+                        b["scroll"] += 1; continue
+                    if key.code == self.term.KEY_PGUP:
+                        b["scroll"] = max(0, b["scroll"] - 10); continue
+                    if key.code == self.term.KEY_PGDOWN:
+                        b["scroll"] += 10; continue
 
                 # ── hotkeys ───────────────────────────────────────────────────
                 if k == "q" or key.code == self.term.KEY_ESCAPE:
@@ -644,12 +833,19 @@ class Dashboard:
                     self._close_all_panels()
                 elif k == "w":
                     self._open_tls()
+                elif k == "f":
+                    self._open_tls_file()
                 elif k == "s":
                     self._open_scraper()
 
     # ── panel open / close ────────────────────────────────────────────────────
 
+    def _stop_tls_batch(self):
+        self.tls_batch["stop"] = True
+        self.tls_batch_mode    = False
+
     def _close_all_panels(self):
+        self._stop_tls_batch()
         self.tls_inspect_mode  = False
         self.web_scraper_mode  = False
         self.ip_scan_mode      = False
@@ -658,6 +854,8 @@ class Dashboard:
         self.active_input_mode = None
         self.input_buffer      = ""
         self._scraper_domain   = ""
+        self._path_matches     = []
+        self._path_error       = ""
 
         self._scraper_filter_key      = None
         self._scraper_filter_template = None
@@ -675,6 +873,7 @@ class Dashboard:
             self.web_scraper_panel.results   = {}
 
     def _open_tls(self):
+        self._stop_tls_batch()
         self.tls_inspect_mode  = True
         self.web_scraper_mode  = False
         self.ip_scan_mode      = False
@@ -685,7 +884,24 @@ class Dashboard:
             self.tls_inspect_panel.scan_done = False
             self.tls_inspect_panel.results   = {}
 
+    def _open_tls_file(self):
+        if self.tls_batch["running"]:
+            # a batch is already going — just bring its panel back up
+            self.tls_inspect_mode = True
+            self.web_scraper_mode = False
+            self.tls_batch_mode   = True
+            return
+        self.tls_inspect_mode  = True
+        self.web_scraper_mode  = False
+        self.ip_scan_mode      = False
+        self.tls_inspect_state = 1
+        self.active_input_mode = "tls_file"
+        self.input_buffer      = self._last_batch_path   # pre-fill last used path
+        self._path_matches     = []
+        self._path_error       = ""
+
     def _open_scraper(self):
+        self._stop_tls_batch()
         self.web_scraper_mode  = True
         self.tls_inspect_mode  = False
         self.ip_scan_mode      = False
@@ -705,6 +921,81 @@ class Dashboard:
             self.web_scraper_panel.fetch_done = False
             self.web_scraper_panel.results    = {}
 
+    # ── TLS batch ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _new_batch_state():
+        return {
+            "running": False, "stop": False, "path": "", "out": "",
+            "total": 0, "current": "", "results": [], "scroll": 0,
+        }
+
+    def _start_tls_batch(self, raw_path):
+        """Validate the path and kick off the worker. Returns an error string or ''."""
+        if not self.tls_inspect_panel:
+            return "TLS module not loaded"
+        path = expand_path(raw_path)
+        if not os.path.isfile(path):
+            return f"not a file: {path}"
+        try:
+            targets = load_tls_targets(path)
+        except OSError as e:
+            return str(e)
+        if not targets:
+            return "no hosts found in file"
+
+        self._last_batch_path = raw_path
+        b = self._new_batch_state()           # fresh dict so an old worker can't touch it
+        b.update(running=True, path=path, total=len(targets))
+        self.tls_batch         = b
+        self.tls_batch_mode    = True
+        self.tls_inspect_state = 4
+        Thread(target=self._run_tls_batch, args=(b, targets), daemon=True).start()
+        return ""
+
+    def _run_tls_batch(self, b, targets):
+        p = self.tls_inspect_panel
+        for host in targets:
+            if b["stop"] or not self.running:
+                break
+            b["current"] = host
+            p.scan_done  = False
+            p.results    = {}
+            try:
+                p.start(host)                 # your backend; blocking or not, both work
+                t0 = time.time()
+                while (not p.scan_done and not b["stop"] and self.running
+                       and time.time() - t0 < self.TLS_BATCH_TIMEOUT):
+                    time.sleep(0.1)
+                res = dict(p.results or {})
+                if not res:
+                    res = {"status": "ERROR", "error": "timeout / no result"}
+            except Exception as e:
+                res = {"status": "ERROR", "error": str(e)}
+            res.setdefault("domain", host)
+            b["results"].append(res)
+
+        b["running"] = False
+        b["current"] = ""
+        if b["results"]:
+            b["out"] = self._export_tls_batch(b)
+        if not b["stop"]:
+            self.switch_animation("success")
+
+    def _export_tls_batch(self, b):
+        base  = os.path.splitext(b["path"])[0]
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        out   = f"{base}_tls_{stamp}.csv"
+        keys  = ["domain", "status", "issuer", "expires", "tls", "cipher", "error"]
+        try:
+            with open(out, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
+                w.writeheader()
+                w.writerows(b["results"])
+            return out
+        except OSError as e:
+            return f"(CSV save failed: {e})"
+
     # ── commit input ──────────────────────────────────────────────────────────
 
     def _commit_input(self):
@@ -717,6 +1008,17 @@ class Dashboard:
             if val and self.tls_inspect_panel:
                 self.tls_inspect_state = 2
                 Thread(target=self.tls_inspect_panel.start, args=(val,), daemon=True).start()
+
+        elif mode == "tls_file":
+            err = self._start_tls_batch(val) if val else "enter a file path"
+            if err:
+                # stay on the prompt, keep what they typed
+                self._path_error       = err
+                self.input_buffer      = val
+                self.active_input_mode = "tls_file"
+            else:
+                self._path_error   = ""
+                self._path_matches = []
 
         elif mode == "scraper_domain":
             if val and self.web_scraper_panel:
@@ -749,6 +1051,7 @@ class Dashboard:
         while self.running:
             time.sleep(0.2)
 
+            # (batch mode uses tls_inspect_state == 4, so this ignores it)
             tls = self.tls_inspect_panel
             if tls and tls.scan_done and self.tls_inspect_state == 2:
                 self.tls_inspect_state = 3
