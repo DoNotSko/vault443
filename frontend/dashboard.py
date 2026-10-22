@@ -886,7 +886,7 @@ class Dashboard:
 
     def _open_tls_file(self):
         if self.tls_batch["running"]:
-            # a batch is already going — just bring its panel back up
+            
             self.tls_inspect_mode = True
             self.web_scraper_mode = False
             self.tls_batch_mode   = True
@@ -896,7 +896,7 @@ class Dashboard:
         self.ip_scan_mode      = False
         self.tls_inspect_state = 1
         self.active_input_mode = "tls_file"
-        self.input_buffer      = self._last_batch_path   # pre-fill last used path
+        self.input_buffer      = self._last_batch_path   
         self._path_matches     = []
         self._path_error       = ""
 
@@ -945,7 +945,7 @@ class Dashboard:
             return "no hosts found in file"
 
         self._last_batch_path = raw_path
-        b = self._new_batch_state()           # fresh dict so an old worker can't touch it
+        b = self._new_batch_state()           
         b.update(running=True, path=path, total=len(targets))
         self.tls_batch         = b
         self.tls_batch_mode    = True
